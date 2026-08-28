@@ -1,31 +1,23 @@
-"""
-Occupancy Estimation Engine for AuraTwin AI
-Converts raw Wi-Fi probe/connected device observations into calibrated occupancy metrics.
+"""CCTV occupancy estimation for AuraTwin AI.
+
+The input is the number of people detected in the latest CCTV snapshot.  The
+engine keeps the capacity classification and percentage calculation in one
+place for the rest of the application.
 """
 
 from typing import Dict, Any, Tuple
 
 
 class OccupancyEngine:
-    """Estimates real-time occupancy and capacity metrics from Wi-Fi telemetry."""
+    """Converts a CCTV person count into zone occupancy metrics."""
 
-    def __init__(self, device_to_person_ratio: float = 1.05):
-        """
-        :param device_to_person_ratio: Average number of Wi-Fi active devices per person
-               (typically ~1.0 to 1.1 in commercial/educational buildings).
-        """
-        self.ratio = device_to_person_ratio
-
-    def estimate_occupancy(self, wifi_devices: int, capacity: int) -> Dict[str, Any]:
+    def estimate_occupancy(self, detected_people: int, capacity: int) -> Dict[str, Any]:
         """
         Estimate occupancy for a given zone.
-        estimated_occupancy = round(detected_devices / ratio)
-        occupancy_percentage = (estimated_occupancy / capacity) * 100
+
+        The detector already returns people, so no conversion is performed here.
         """
-        if wifi_devices <= 0:
-            estimated_count = 0
-        else:
-            estimated_count = max(1, int(round(wifi_devices / self.ratio)))
+        estimated_count = max(0, int(detected_people))
 
         # Cap at 130% capacity to account for overflow/crowding
         estimated_count = min(estimated_count, int(capacity * 1.3))
@@ -43,7 +35,7 @@ class OccupancyEngine:
             category = "High"
 
         return {
-            "wifi_devices": wifi_devices,
+            "detected_people": estimated_count,
             "estimated_occupancy": estimated_count,
             "capacity": capacity,
             "occupancy_percentage": occupancy_percentage,

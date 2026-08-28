@@ -1,6 +1,6 @@
-"""
-K-Means Zone Density Intelligence Engine for AuraTwin AI
-Clusters zones into Low, Medium, and High Density, and calculates the Zone Density Index (ZDI).
+"""K-Means zone-density intelligence for AuraTwin AI.
+
+The first feature is the person count detected by CCTV.
 """
 
 import math
@@ -25,7 +25,7 @@ class KMeansClusterer:
         self._init_default_centroids()
 
     def _init_default_centroids(self):
-        """Initial baseline centroids [devices, temp_c, power_kw, hour_norm, occ_ratio]."""
+        """Initial baseline centroids [people, temp_c, power_kw, hour_norm, occ_ratio]."""
         self.feature_mins = [0.0, 18.0, 1.0, 0.0, 0.0]
         self.feature_maxs = [120.0, 32.0, 30.0, 24.0, 1.0]
 
@@ -76,7 +76,7 @@ class KMeansClusterer:
 
             centroids = new_centroids
 
-        # Sort centroids by first feature (device count/density weight)
+        # Sort centroids by people/occupancy density
         centroids.sort(key=lambda c: c[0] + c[4])
         self.centroids = centroids
         self.save_model()
@@ -87,7 +87,7 @@ class KMeansClusterer:
     def predict(self, features: List[float]) -> Tuple[int, str, float]:
         """
         Predict cluster and calculate Zone Density Index (ZDI).
-        :param features: [wifi_devices, temperature, power_kw, time_of_day_hour, occupancy_ratio]
+        :param features: [detected_people, temperature, power_kw, time_of_day_hour, occupancy_ratio]
         :return: (cluster_id, cluster_name, zdi_score between 0.0 and 1.0)
         """
         norm_vec = self._normalize(features)
@@ -95,12 +95,12 @@ class KMeansClusterer:
         cluster_id = dists.index(min(dists))
 
         # Calculate continuous Zone Density Index (ZDI)
-        # Weighted combination of occupancy ratio (50%), device intensity (30%), power load (20%)
-        dev_score = norm_vec[0]
+        # Weighted combination of occupancy ratio (50%), people count (30%), power load (20%)
+        people_score = norm_vec[0]
         occ_score = norm_vec[4]
         power_score = norm_vec[2]
 
-        zdi = round(0.50 * occ_score + 0.30 * dev_score + 0.20 * power_score, 3)
+        zdi = round(0.50 * occ_score + 0.30 * people_score + 0.20 * power_score, 3)
         zdi = max(0.0, min(1.0, zdi))
 
         cluster_name = self.cluster_labels[cluster_id]

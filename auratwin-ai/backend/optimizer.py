@@ -1,6 +1,7 @@
-"""
-OR-Tools / Mathematical HVAC Optimizer for AuraTwin AI
-Formulates constrained multi-zone optimization minimizing total Energy Cost + Comfort Penalty.
+"""Discrete mathematical HVAC optimizer for AuraTwin AI.
+
+The optimizer evaluates constrained setpoint candidates and minimizes an
+energy-cost plus comfort-penalty score.
 """
 
 from typing import List, Dict, Any
@@ -34,7 +35,6 @@ class HVACOptimizer:
             zone_name = zone.get("name")
             zone_type = zone.get("type", "standard")
             capacity = zone.get("capacity", 20)
-            wifi_devices = zone.get("wifi_devices", 0)
             est_occ = zone.get("estimated_occupancy", 0)
             occ_ratio = zone.get("occupancy_percentage", 0.0) / 100.0
             current_temp = zone.get("current_temp_c", 25.0)
@@ -102,7 +102,7 @@ class HVACOptimizer:
                 # Formulate intelligent justification
                 if est_occ == 0:
                     mode = "Eco Standby"
-                    reason = f"Zero occupancy detected via Wi-Fi telemetry. Relaxed setpoint to {rec_setpoint}°C to eliminate phantom cooling."
+                    reason = f"Zero occupancy detected via CCTV snapshot. Relaxed setpoint to {rec_setpoint}°C to eliminate phantom cooling."
                 elif occ_ratio < 0.35:
                     mode = "Low-Density Dynamic"
                     reason = f"Low occupancy ({est_occ}/{capacity}). Setpoint optimized to {rec_setpoint}°C to preserve comfort while shaving peak load."

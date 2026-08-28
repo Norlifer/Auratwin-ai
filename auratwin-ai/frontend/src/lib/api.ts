@@ -4,7 +4,9 @@ export interface ZoneTelemetry {
   zone_id: string;
   name: string;
   type: string;
-  wifi_devices: number;
+  detected_people: number;
+  snapshot_uploaded: boolean;
+  snapshot_timestamp: string | null;
   estimated_occupancy: number;
   capacity: number;
   occupancy_percentage: number;
@@ -50,6 +52,41 @@ export interface AIRecommendation {
   tariff_adjusted: boolean;
 }
 
+export interface SnapshotResult {
+  status: string;
+  zone_id: string;
+  filename: string;
+  people_count: number;
+  head_count: number;
+  width: number;
+  height: number;
+  timestamp: string;
+  annotated_image_url: string;
+}
+
+export interface AutomationStatus {
+  enabled: boolean;
+  dataset_path: string | null;
+  output_path: string;
+  state_path: string;
+  interval_minutes: number;
+  default_zone_id: string;
+  video_frame_step: number;
+  recursive: boolean;
+  reprocess_completed: boolean;
+  tracked_items: number;
+  item_status_counts: Record<string, number>;
+  running: boolean;
+  job_running: boolean;
+  last_processed_file: string | null;
+  last_processed_frame: number | null;
+  last_processed_zone: string | null;
+  last_processed_at: string | null;
+  last_result_path: string | null;
+  last_error: unknown;
+  last_job: unknown;
+}
+
 export const api = {
   getTelemetry: async () => {
     const res = await fetch(`${API_BASE}/telemetry`);
@@ -57,6 +94,28 @@ export const api = {
   },
   getRecommendations: async () => {
     const res = await fetch(`${API_BASE}/recommendations`);
+    return res.json();
+  },
+  uploadSnapshot: async (zoneId: string, file: File): Promise<SnapshotResult> => {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${API_BASE}/snapshots/${zoneId}`, {
+      method: 'POST',
+      body: form,
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || 'Snapshot detection failed');
+    return res.json();
+  },
+  getSnapshot: async (zoneId: string) => {
+    const res = await fetch(`${API_BASE}/snapshots/${zoneId}`);
+    return res.json();
+  },
+  getAutomationStatus: async (): Promise<AutomationStatus> => {
+    const res = await fetch(`${API_BASE}/automation/status`);
+    return res.json();
+  },
+  runAutomationNow: async () => {
+    const res = await fetch(`${API_BASE}/automation/run-now`, { method: 'POST' });
     return res.json();
   },
   overrideSetpoint: async (zoneId: string, setpoint: number, isManual = true) => {

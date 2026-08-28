@@ -1,14 +1,14 @@
 """
 AuraTwin AI - Core FastAPI Application Server
-Provides REST APIs for Wi-Fi Telemetry, Occupancy Intelligence, OR-Tools Optimization, Virtual BACnet, and AI Facility Manager.
+Provides REST APIs for CCTV Telemetry, Occupancy Intelligence, HVAC Optimization, Virtual BACnet, and AI Facility Manager.
 """
 
 import os
 import json
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, Query, HTTPException, Body
+from fastapi import FastAPI, Query, HTTPException, Body, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from data_generator import telemetry_simulator
@@ -18,6 +18,12 @@ from energy import energy_engine
 from optimizer import hvac_optimizer
 from bacnet import bacnet_building
 from agent import facility_agent
+from cctv import cctv_detector
+from cctv_automation import (
+    CCTVAutomationConfig,
+    CCTVAutomationProcessor,
+    CCTVAutomationScheduler,
+)
 
 app = FastAPI(
     title="AuraTwin AI API",
@@ -35,10 +41,30 @@ app.add_middleware(
 )
 
 
+# Dataset automation is deliberately composed around the existing detector.
+# The scheduler is started/stopped with the FastAPI application lifecycle.
+automation_config = CCTVAutomationConfig.from_env()
+automation_processor = CCTVAutomationProcessor(
+    automation_config,
+    detector=cctv_detector,
+    zone_ids={zone["id"] for zone in telemetry_simulator.zones},
+)
+automation_scheduler = CCTVAutomationScheduler(automation_processor)
+
+
+@app.on_event("startup")
+def start_cctv_automation() -> None:
+    automation_scheduler.start()
+
+
+@app.on_event("shutdown")
+def stop_cctv_automation() -> None:
+    automation_scheduler.stop()
+
+
 # Pydantic Request Models
 class TelemetryInput(BaseModel):
     zone: str
-    wifi_devices: int
     temperature: float
     humidity: Optional[float] = 55.0
     power_kw: Optional[float] = None
@@ -83,6 +109,18 @@ def health_check():
     }
 
 
+@app.get("/automation/status")
+def cctv_automation_status():
+    """Return scheduler state, dataset cursor, and the latest automation result."""
+    return automation_scheduler.status()
+
+
+@app.post("/automation/run-now")
+def run_cctv_automation_now():
+    """Run one guarded dataset job immediately for testing or an operator action."""
+    return automation_scheduler.run_once()
+
+
 @app.get("/zones")
 def get_zones():
     """Retrieve metadata and physical specifications for all 10 building zones."""
@@ -102,7 +140,7 @@ def get_zone_by_id(zone_id: str):
 
 @app.get("/telemetry")
 def get_telemetry():
-    """Retrieve the latest real-time Wi-Fi, HVAC, and thermal telemetry across all zones."""
+    """Retrieve the latest real-time CCTV, HVAC, and thermal telemetry across all zones."""
     telemetry, energy_summary, _ = get_current_system_state()
     return {
         "simulation_time": telemetry_simulator.current_simulation_time.isoformat(),
@@ -114,7 +152,7 @@ def get_telemetry():
 
 @app.post("/telemetry")
 def post_telemetry(payload: TelemetryInput):
-    """Ingest real or simulated external Wi-Fi / temperature sensor telemetry."""
+    """Ingest optional external temperature telemetry for a known zone."""
     zone_id = payload.zone if payload.zone.startswith("zone_") else f"zone_{payload.zone.lower().replace(' ', '_')}"
     ctrl = bacnet_building.controllers.get(zone_id)
     if not ctrl:
@@ -139,16 +177,82 @@ def post_telemetry(payload: TelemetryInput):
     }
 
 
+def _validate_zone(zone_id: str) -> None:
+    if zone_id not in bacnet_building.controllers:
+        raise HTTPException(status_code=404, detail="Zone not found")
+
+
+async def _process_snapshot_upload(zone_id: str, file: UploadFile) -> Dict[str, Any]:
+    """Process one uploaded CCTV image and expose its count to the simulator."""
+    _validate_zone(zone_id)
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=415, detail="Upload a JPEG, PNG, or other image file")
+
+    image_bytes = await file.read()
+    try:
+        result = cctv_detector.process_snapshot(
+            zone_id,
+            image_bytes,
+            filename=file.filename or "snapshot.jpg",
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"CCTV detection failed: {error}") from error
+
+    result["status"] = "processed"
+    result["annotated_image_url"] = f"/snapshots/{zone_id}/annotated"
+    return result
+
+
+@app.post("/snapshots/{zone_id}")
+async def upload_snapshot(zone_id: str, file: UploadFile = File(...)):
+    """Count people in a CCTV snapshot and make that count the zone occupancy."""
+    return await _process_snapshot_upload(zone_id, file)
+
+
+@app.post("/snapshot")
+async def upload_snapshot_form(
+    zone_id: str = Form(...),
+    file: UploadFile = File(...),
+):
+    """Form-friendly alias for clients that submit zone_id and image together."""
+    return await _process_snapshot_upload(zone_id, file)
+
+
+@app.get("/snapshots/{zone_id}")
+def get_snapshot(zone_id: str):
+    """Return the latest snapshot metadata and detected people count."""
+    _validate_zone(zone_id)
+    snapshot = cctv_detector.get_snapshot_metadata(zone_id)
+    return snapshot or {
+        "zone_id": zone_id,
+        "people_count": 0,
+        "head_count": 0,
+        "status": "no_snapshot_uploaded",
+    }
+
+
+@app.get("/snapshots/{zone_id}/annotated")
+def get_annotated_snapshot(zone_id: str):
+    """Serve the latest in-memory annotated image for visual verification."""
+    _validate_zone(zone_id)
+    image = cctv_detector.get_annotated_image(zone_id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="No snapshot uploaded for this zone")
+    return Response(content=image, media_type="image/jpeg")
+
+
 @app.get("/occupancy")
 def get_occupancy():
-    """Retrieve Wi-Fi based occupancy estimations, capacity ratios, and K-Means density indices."""
+    """Retrieve CCTV-based occupancy estimations and K-Means density indices."""
     telemetry, _, _ = get_current_system_state()
-    total_devices = sum(z["wifi_devices"] for z in telemetry)
+    total_people = sum(z["detected_people"] for z in telemetry)
     total_occupancy = sum(z["estimated_occupancy"] for z in telemetry)
     total_capacity = sum(z["capacity"] for z in telemetry)
     
     return {
-        "total_wifi_devices": total_devices,
+        "total_detected_people": total_people,
         "total_estimated_occupancy": total_occupancy,
         "total_capacity": total_capacity,
         "building_occupancy_percentage": round((total_occupancy / max(1, total_capacity)) * 100, 1),
@@ -156,7 +260,7 @@ def get_occupancy():
             {
                 "zone_id": z["zone_id"],
                 "name": z["name"],
-                "wifi_devices": z["wifi_devices"],
+                "detected_people": z["detected_people"],
                 "estimated_occupancy": z["estimated_occupancy"],
                 "capacity": z["capacity"],
                 "occupancy_percentage": z["occupancy_percentage"],
@@ -193,7 +297,7 @@ def get_energy():
 
 @app.get("/recommendations")
 def get_recommendations():
-    """Retrieve OR-Tools optimized HVAC setpoints and eco setback strategies."""
+    """Retrieve optimized HVAC setpoints and eco setback strategies."""
     _, energy_summary, recommendations = get_current_system_state()
     return {
         "tariff_tier": energy_summary["tariff_tier"],
@@ -321,7 +425,7 @@ DASHBOARD_HTML = """
                         <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-ping"></span> Live Virtual BACnet
                     </span>
                 </div>
-                <p class="text-xs text-slate-400">Wi-Fi Telemetry &bull; K-Means Density &bull; OR-Tools Setpoint Optimization</p>
+                <p class="text-xs text-slate-400">CCTV Telemetry &bull; K-Means Density &bull; HVAC Setpoint Optimization</p>
             </div>
         </div>
 
@@ -388,7 +492,7 @@ DASHBOARD_HTML = """
             </div>
             <div class="text-2xl font-bold text-purple-300"><span id="metricOccupancy">--</span> <span class="text-xs font-normal text-slate-400">people</span></div>
             <div class="text-xs text-slate-400 mt-1">
-                <span id="metricWifiDevices">--</span> Wi-Fi devices detected
+                <span id="metricDetectedPeople">--</span> people detected by CCTV
             </div>
         </div>
 
@@ -461,7 +565,7 @@ DASHBOARD_HTML = """
             <div class="glass-card p-5">
                 <div class="flex items-center justify-between mb-3">
                     <h3 class="text-sm font-semibold text-white flex items-center gap-2">
-                        <i class="fa-solid fa-microchip text-emerald-400"></i> OR-Tools Optimization Engine
+                        <i class="fa-solid fa-microchip text-emerald-400"></i> HVAC Optimization Engine
                     </h3>
                     <span id="recBadge" class="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono">10 Active</span>
                 </div>
@@ -486,10 +590,24 @@ DASHBOARD_HTML = """
                         <span class="text-[10px] text-slate-400">Humidity: <span id="detailHumidity">--</span>%</span>
                     </div>
                     <div class="bg-gray-800/60 p-2.5 rounded-lg border border-gray-700/50">
-                        <span class="text-slate-400">Wi-Fi & Occupancy</span>
+                        <span class="text-slate-400">CCTV & Occupancy</span>
                         <div class="text-lg font-bold text-purple-300 mt-0.5"><span id="detailOcc">--</span> / <span id="detailCap">--</span></div>
-                        <span class="text-[10px] text-slate-400"><span id="detailWifi">--</span> active devices</span>
+                        <span class="text-[10px] text-slate-400"><span id="detailPeople">--</span> people in latest snapshot</span>
                     </div>
+                </div>
+
+                <!-- CCTV Snapshot Upload -->
+                <div class="rounded-lg border border-gray-700/60 bg-gray-900/60 p-3 mb-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <span class="text-xs font-semibold text-slate-200">Update CCTV Snapshot</span>
+                        <span id="snapshotStatus" class="text-[10px] text-slate-400">No snapshot uploaded</span>
+                    </div>
+                    <input type="file" id="snapshotFile" accept="image/*"
+                           class="block w-full text-[11px] text-slate-400 file:mr-2 file:rounded file:border-0 file:bg-cyan-700 file:px-2 file:py-1 file:text-[11px] file:font-semibold file:text-white hover:file:bg-cyan-600" />
+                    <button onclick="uploadSnapshot()" class="mt-2 w-full py-1.5 bg-purple-600 hover:bg-purple-500 text-xs font-semibold rounded-lg text-white transition">
+                        <i class="fa-solid fa-camera mr-1"></i> Detect People in Snapshot
+                    </button>
+                    <img id="snapshotPreview" class="hidden mt-2 max-h-32 w-full rounded object-contain border border-gray-700" alt="Annotated CCTV snapshot" />
                 </div>
 
                 <!-- Setpoint Slider & BACnet Write -->
@@ -526,7 +644,7 @@ DASHBOARD_HTML = """
                 <!-- Chat history -->
                 <div id="chatHistory" class="flex-1 overflow-y-auto space-y-3 pr-1 text-xs text-slate-200">
                     <div class="p-2.5 rounded-lg bg-gray-800/80 border border-gray-700 text-slate-300">
-                        Hello! I am your <strong>AuraTwin AI Facility Manager</strong>. I monitor all 10 virtual HVAC zones, real-time Wi-Fi device density, and electricity tariffs. How can I assist you?
+                        Hello! I am your <strong>AuraTwin AI Facility Manager</strong>. I monitor all 10 virtual HVAC zones, CCTV person counts, and electricity tariffs. How can I assist you?
                     </div>
                 </div>
 
@@ -601,9 +719,9 @@ DASHBOARD_HTML = """
                 document.getElementById('metricSavedDollars').textContent = es.today_savings_usd.toFixed(2);
 
                 const totalOcc = currentTelemetry.reduce((acc, z) => acc + z.estimated_occupancy, 0);
-                const totalDev = currentTelemetry.reduce((acc, z) => acc + z.wifi_devices, 0);
+                const totalPeople = currentTelemetry.reduce((acc, z) => acc + z.detected_people, 0);
                 document.getElementById('metricOccupancy').textContent = totalOcc;
-                document.getElementById('metricWifiDevices').textContent = totalDev;
+                document.getElementById('metricDetectedPeople').textContent = totalPeople;
 
                 // Update Floorplan
                 renderFloorplan();
@@ -701,13 +819,13 @@ DASHBOARD_HTML = """
                 textTemp.textContent = `Temp: ${z.temperature_c}°C (SP: ${z.setpoint_c}°C)`;
                 g.appendChild(textTemp);
 
-                // Occupancy Badge & Wi-Fi
+                // Occupancy badge from the latest CCTV snapshot
                 const textOcc = document.createElementNS("http://www.w3.org/2000/svg", "text");
                 textOcc.setAttribute("x", fp.x + 12);
                 textOcc.setAttribute("y", fp.y + 62);
                 textOcc.setAttribute("fill", "#C084FC");
                 textOcc.setAttribute("font-size", "11");
-                textOcc.textContent = `👥 ${z.estimated_occupancy}/${z.capacity} (${z.wifi_devices} Wi-Fi)`;
+                textOcc.textContent = `👥 ${z.estimated_occupancy}/${z.capacity} (CCTV)`;
                 g.appendChild(textOcc);
 
                 // Power in kW
@@ -736,6 +854,7 @@ DASHBOARD_HTML = """
 
         function selectZone(zoneId) {
             selectedZoneId = zoneId;
+            document.getElementById('snapshotPreview').classList.add('hidden');
             renderFloorplan();
             updateZoneDetailPanel();
         }
@@ -750,10 +869,46 @@ DASHBOARD_HTML = """
             document.getElementById('detailHumidity').textContent = z.humidity_pct;
             document.getElementById('detailOcc').textContent = z.estimated_occupancy;
             document.getElementById('detailCap').textContent = z.capacity;
-            document.getElementById('detailWifi').textContent = z.wifi_devices;
+            document.getElementById('detailPeople').textContent = z.detected_people;
+            document.getElementById('snapshotStatus').textContent = z.snapshot_uploaded ? `${z.detected_people} people detected` : 'No snapshot uploaded';
+            const preview = document.getElementById('snapshotPreview');
+            if (z.snapshot_uploaded) {
+                // This also displays results produced by the background dataset
+                // scheduler, not only images uploaded from this browser.
+                preview.src = `/snapshots/${selectedZoneId}/annotated?t=${encodeURIComponent(z.snapshot_timestamp || Date.now())}`;
+                preview.classList.remove('hidden');
+            } else {
+                preview.removeAttribute('src');
+                preview.classList.add('hidden');
+            }
             document.getElementById('setpointSlider').value = z.setpoint_c;
             document.getElementById('sliderVal').textContent = z.setpoint_c;
             document.getElementById('detailOverrideBadge').textContent = z.manual_override ? "Manual Override" : "Autonomous AI";
+        }
+
+        async function uploadSnapshot() {
+            const input = document.getElementById('snapshotFile');
+            const status = document.getElementById('snapshotStatus');
+            if (!input.files || !input.files[0]) {
+                status.textContent = 'Choose an image first';
+                return;
+            }
+
+            status.textContent = 'Detecting...';
+            const form = new FormData();
+            form.append('file', input.files[0]);
+            try {
+                const res = await fetch(`/snapshots/${selectedZoneId}`, { method: 'POST', body: form });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Snapshot detection failed');
+                status.textContent = `${data.people_count} people detected`;
+                await fetchState();
+                const preview = document.getElementById('snapshotPreview');
+                preview.src = `${data.annotated_image_url}?t=${Date.now()}`;
+                preview.classList.remove('hidden');
+            } catch (error) {
+                status.textContent = error.message;
+            }
         }
 
         async function overrideSelectedSetpoint() {
