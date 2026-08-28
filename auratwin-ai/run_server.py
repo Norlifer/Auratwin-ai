@@ -6,9 +6,16 @@ Starts the AuraTwin AI FastAPI server and automatically locates your Python envi
 import os
 import sys
 import subprocess
+import logging
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 backend_dir = os.path.join(current_dir, "backend")
+
+# Keep CCTV automation progress visible alongside Uvicorn output.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
 
 # Ensure backend directory is in python path
 sys.path.insert(0, backend_dir)
